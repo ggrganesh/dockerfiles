@@ -5,7 +5,7 @@ ENV course="Devops"\
 
 # here is user1 is default value 
 ARG username=some_user
-RUN echo "Hello user: ${username}"
+RUN echo "Hello user: ${username}" > name.txt
 CMD ["sleep", "200"]
 
 

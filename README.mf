@@ -1,0 +1,1415 @@
+# Databricks Terraform Deployment with GitHub Actions
+
+## Complete CI/CD Pipeline for Databricks Unity Catalog
+
+This guide provides a complete setup for deploying Databricks resources using Terraform through GitHub Actions, without requiring local Terraform installation.
+
+---
+
+## Table of Contents
+
+1. [Prerequisites](#prerequisites)
+2. [GitHub Repository Setup](#github-repository-setup)
+3. [GitHub Secrets Configuration](#github-secrets-configuration)
+4. [Project Structure](#project-structure)
+5. [GitHub Actions Workflows](#github-actions-workflows)
+6. [Terraform Configuration Files](#terraform-configuration-files)
+7. [Deployment Process](#deployment-process)
+8. [Pull Request Workflow](#pull-request-workflow)
+9. [Troubleshooting](#troubleshooting)
+
+---
+
+## Prerequisites
+
+### Required Access
+- ✅ GitHub account with repository access
+- ✅ Databricks Workspace access
+- ✅ Metastore Admin permission
+- ✅ Azure Storage Blob Data Contributor
+- ✅ Access to Azure Service Principal credentials (from admin)
+
+### Information to Collect
+Before starting, gather this information:
+
+```bash
+# Databricks Information
+DATABRICKS_HOST="https://adb-xxxxx.azuredatabricks.net"
+DATABRICKS_TOKEN="dapi_xxxxx"  # Generate PAT in Databricks
+
+# Azure Information (from admin)
+ARM_CLIENT_ID="xxxxx-xxxxx-xxxxx"
+ARM_CLIENT_SECRET="xxxxx"
+ARM_TENANT_ID="xxxxx-xxxxx-xxxxx"
+ARM_SUBSCRIPTION_ID="xxxxx-xxxxx-xxxxx"
+
+# Resource Information
+RESOURCE_GROUP_NAME="rg-databricks-dev"
+STORAGE_ACCOUNT_NAME="stdevdatalake001"
+ACCESS_CONNECTOR_ID="/subscriptions/.../accessConnectors/dac-dev-uc"
+
+# Terraform State Storage (backend)
+TF_STATE_RESOURCE_GROUP="rg-terraform-state"
+TF_STATE_STORAGE_ACCOUNT="sttfstatedatabricks"
+TF_STATE_CONTAINER="tfstate"
+```
+
+---
+
+## GitHub Repository Setup
+
+### Step 1: Create GitHub Repository
+
+```bash
+# Option 1: Via GitHub Web UI
+# 1. Go to https://github.com/new
+# 2. Name: databricks-terraform-uc
+# 3. Description: Databricks Unity Catalog Infrastructure as Code
+# 4. Private repository (recommended)
+# 5. Initialize with README
+# 6. Create repository
+
+# Option 2: Via GitHub CLI (if available on your machine)
+gh repo create databricks-terraform-uc --private --description "Databricks Unity Catalog IaC"
+```
+
+### Step 2: Clone Repository to Your Machine
+
+```bash
+# Clone the repository
+git clone https://github.com/YOUR_ORG/databricks-terraform-uc.git
+cd databricks-terraform-uc
+
+# Create directory structure
+mkdir -p .github/workflows
+mkdir -p terraform/environments/dev
+mkdir -p terraform/environments/prod
+```
+
+---
+
+## GitHub Secrets Configuration
+
+### Step 1: Add Repository Secrets
+
+Go to your GitHub repository:
+1. Click **Settings** → **Secrets and variables** → **Actions**
+2. Click **New repository secret**
+3. Add the following secrets:
+
+#### Azure Credentials
+
+```yaml
+# Azure Service Principal
+ARM_CLIENT_ID: "xxxxx-xxxxx-xxxxx-xxxxx"
+ARM_CLIENT_SECRET: "your-secret-here"
+ARM_TENANT_ID: "xxxxx-xxxxx-xxxxx-xxxxx"
+ARM_SUBSCRIPTION_ID: "xxxxx-xxxxx-xxxxx-xxxxx"
+
+# Terraform Backend
+TF_STATE_RESOURCE_GROUP: "rg-terraform-state"
+TF_STATE_STORAGE_ACCOUNT: "sttfstatedatabricks"
+TF_STATE_CONTAINER: "tfstate"
+TF_STATE_KEY_DEV: "dev/databricks.tfstate"
+TF_STATE_KEY_PROD: "prod/databricks.tfstate"
+```
+
+#### Databricks Credentials
+
+```yaml
+# Dev Environment
+DATABRICKS_HOST_DEV: "https://adb-xxxxx.azuredatabricks.net"
+DATABRICKS_TOKEN_DEV: "dapi_your_dev_token"
+
+# Prod Environment (when ready)
+DATABRICKS_HOST_PROD: "https://adb-xxxxx.azuredatabricks.net"
+DATABRICKS_TOKEN_PROD: "dapi_your_prod_token"
+```
+
+#### Resource Configuration
+
+```yaml
+# Dev Environment
+DEV_RESOURCE_GROUP: "rg-databricks-dev"
+DEV_STORAGE_ACCOUNT: "stdevdatalake001"
+DEV_ACCESS_CONNECTOR_ID: "/subscriptions/.../accessConnectors/dac-dev-uc"
+DEV_CATALOG_NAME: "dev_catalog"
+
+# Prod Environment
+PROD_RESOURCE_GROUP: "rg-databricks-prod"
+PROD_STORAGE_ACCOUNT: "stproddatalake001"
+PROD_ACCESS_CONNECTOR_ID: "/subscriptions/.../accessConnectors/dac-prod-uc"
+PROD_CATALOG_NAME: "prod_catalog"
+```
+
+### Step 2: Add Environment Secrets (Optional but Recommended)
+
+For better security and deployment controls:
+
+1. Go to **Settings** → **Environments**
+2. Create two environments: `dev` and `prod`
+3. For `prod` environment:
+   - Add **Required reviewers** (yourself or team)
+   - Add **Wait timer** (e.g., 5 minutes)
+4. Add environment-specific secrets to each
+
+---
+
+## Project Structure
+
+Create this structure in your repository:
+
+```
+databricks-terraform-uc/
+├── .github/
+│   └── workflows/
+│       ├── terraform-plan.yml           # PR validation
+│       ├── terraform-apply-dev.yml      # Dev deployment
+│       ├── terraform-apply-prod.yml     # Prod deployment
+│       └── terraform-destroy.yml        # Cleanup (optional)
+│
+├── terraform/
+│   ├── environments/
+│   │   ├── dev/
+│   │   │   ├── backend.tf
+│   │   │   ├── main.tf
+│   │   │   ├── variables.tf
+│   │   │   └── terraform.tfvars
+│   │   └── prod/
+│   │       ├── backend.tf
+│   │       ├── main.tf
+│   │       ├── variables.tf
+│   │       └── terraform.tfvars
+│   │
+│   └── modules/                         # Optional: reusable modules
+│       ├── unity-catalog/
+│       ├── storage/
+│       └── governance/
+│
+├── .gitignore
+├── README.md
+└── CHANGELOG.md
+```
+
+---
+
+## GitHub Actions Workflows
+
+### Workflow 1: Terraform Plan (On Pull Request)
+
+**File**: `.github/workflows/terraform-plan.yml`
+
+```yaml
+name: 'Terraform Plan'
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+
+env:
+  TF_VERSION: '1.7.0'
+  WORKING_DIR: './terraform/environments/dev'
+
+jobs:
+  terraform-plan:
+    name: 'Terraform Plan - Dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure Azure Credentials
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          echo "Azure credentials configured"
+
+      - name: Terraform Init
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY_DEV }}"
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_DEV }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_DEV }}
+          TF_VAR_resource_group_name: ${{ secrets.DEV_RESOURCE_GROUP }}
+          TF_VAR_storage_account_name: ${{ secrets.DEV_STORAGE_ACCOUNT }}
+          TF_VAR_access_connector_id: ${{ secrets.DEV_ACCESS_CONNECTOR_ID }}
+          TF_VAR_catalog_name: ${{ secrets.DEV_CATALOG_NAME }}
+        run: |
+          terraform plan -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Comment PR with Plan
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}/tfplan
+          retention-days: 5
+```
+
+### Workflow 2: Terraform Apply - Dev Environment
+
+**File**: `.github/workflows/terraform-apply-dev.yml`
+
+```yaml
+name: 'Terraform Apply - Dev'
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/environments/dev/**'
+      - '.github/workflows/terraform-apply-dev.yml'
+  
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  TF_VERSION: '1.7.0'
+  WORKING_DIR: './terraform/environments/dev'
+
+jobs:
+  terraform-apply:
+    name: 'Terraform Apply - Dev'
+    runs-on: ubuntu-latest
+    environment: dev  # Use environment protection rules
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY_DEV }}"
+
+      - name: Terraform Plan
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_DEV }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_DEV }}
+          TF_VAR_resource_group_name: ${{ secrets.DEV_RESOURCE_GROUP }}
+          TF_VAR_storage_account_name: ${{ secrets.DEV_STORAGE_ACCOUNT }}
+          TF_VAR_access_connector_id: ${{ secrets.DEV_ACCESS_CONNECTOR_ID }}
+          TF_VAR_catalog_name: ${{ secrets.DEV_CATALOG_NAME }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_DEV }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_DEV }}
+          TF_VAR_resource_group_name: ${{ secrets.DEV_RESOURCE_GROUP }}
+          TF_VAR_storage_account_name: ${{ secrets.DEV_STORAGE_ACCOUNT }}
+          TF_VAR_access_connector_id: ${{ secrets.DEV_ACCESS_CONNECTOR_ID }}
+          TF_VAR_catalog_name: ${{ secrets.DEV_CATALOG_NAME }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Output
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_DEV }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_DEV }}
+        run: terraform output -json > outputs.json
+
+      - name: Upload Outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs-dev
+          path: ${{ env.WORKING_DIR }}/outputs.json
+          retention-days: 30
+
+      - name: Create Deployment Summary
+        run: |
+          echo "## Terraform Apply - Dev Environment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Status**: Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "🕐 **Time**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "👤 **Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "📝 **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+```
+
+### Workflow 3: Terraform Apply - Production Environment
+
+**File**: `.github/workflows/terraform-apply-prod.yml`
+
+```yaml
+name: 'Terraform Apply - Prod'
+
+on:
+  workflow_dispatch:  # Manual trigger only for production
+    inputs:
+      confirm:
+        description: 'Type "apply" to confirm production deployment'
+        required: true
+        default: ''
+
+env:
+  TF_VERSION: '1.7.0'
+  WORKING_DIR: './terraform/environments/prod'
+
+jobs:
+  validate-input:
+    name: 'Validate Input'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "apply" ]; then
+            echo "❌ Deployment cancelled: confirmation not provided"
+            exit 1
+          fi
+          echo "✅ Confirmation received, proceeding with deployment"
+
+  terraform-apply:
+    name: 'Terraform Apply - Prod'
+    needs: validate-input
+    runs-on: ubuntu-latest
+    environment: prod  # Requires approval
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.TF_STATE_KEY_PROD }}"
+
+      - name: Terraform Plan
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_PROD }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_PROD }}
+          TF_VAR_resource_group_name: ${{ secrets.PROD_RESOURCE_GROUP }}
+          TF_VAR_storage_account_name: ${{ secrets.PROD_STORAGE_ACCOUNT }}
+          TF_VAR_access_connector_id: ${{ secrets.PROD_ACCESS_CONNECTOR_ID }}
+          TF_VAR_catalog_name: ${{ secrets.PROD_CATALOG_NAME }}
+        run: terraform plan -out=tfplan
+
+      - name: Wait for Manual Verification
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ${{ github.actor }}
+          minimum-approvals: 1
+          issue-title: "Production Deployment Approval Required"
+          issue-body: "Please review the Terraform plan and approve the production deployment."
+
+      - name: Terraform Apply
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_PROD }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_PROD }}
+          TF_VAR_resource_group_name: ${{ secrets.PROD_RESOURCE_GROUP }}
+          TF_VAR_storage_account_name: ${{ secrets.PROD_STORAGE_ACCOUNT }}
+          TF_VAR_access_connector_id: ${{ secrets.PROD_ACCESS_CONNECTOR_ID }}
+          TF_VAR_catalog_name: ${{ secrets.PROD_CATALOG_NAME }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Create Deployment Summary
+        run: |
+          echo "## 🚀 Terraform Apply - PRODUCTION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Status**: Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "🕐 **Time**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "👤 **Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "📝 **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Environment**: PRODUCTION" >> $GITHUB_STEP_SUMMARY
+```
+
+### Workflow 4: Terraform Destroy (Optional - Use with Caution)
+
+**File**: `.github/workflows/terraform-destroy.yml`
+
+```yaml
+name: 'Terraform Destroy'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      confirm:
+        description: 'Type "destroy" to confirm'
+        required: true
+        default: ''
+
+env:
+  TF_VERSION: '1.7.0'
+
+jobs:
+  terraform-destroy:
+    name: 'Terraform Destroy'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Check Confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "destroy" ]; then
+            echo "❌ Destroy cancelled: confirmation not provided"
+            exit 1
+          fi
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Set Working Directory
+        id: set-dir
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "dev" ]; then
+            echo "working_dir=./terraform/environments/dev" >> $GITHUB_OUTPUT
+            echo "state_key=${{ secrets.TF_STATE_KEY_DEV }}" >> $GITHUB_OUTPUT
+          else
+            echo "working_dir=./terraform/environments/prod" >> $GITHUB_OUTPUT
+            echo "state_key=${{ secrets.TF_STATE_KEY_PROD }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Terraform Init
+        working-directory: ${{ steps.set-dir.outputs.working_dir }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ steps.set-dir.outputs.state_key }}"
+
+      - name: Terraform Destroy
+        working-directory: ${{ steps.set-dir.outputs.working_dir }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          DATABRICKS_HOST: ${{ github.event.inputs.environment == 'dev' && secrets.DATABRICKS_HOST_DEV || secrets.DATABRICKS_HOST_PROD }}
+          DATABRICKS_TOKEN: ${{ github.event.inputs.environment == 'dev' && secrets.DATABRICKS_TOKEN_DEV || secrets.DATABRICKS_TOKEN_PROD }}
+        run: terraform destroy -auto-approve
+```
+
+---
+
+## Terraform Configuration Files
+
+### Dev Environment Configuration
+
+**File**: `terraform/environments/dev/backend.tf`
+
+```hcl
+terraform {
+  backend "azurerm" {
+    # Backend configuration provided via GitHub Actions
+    # -backend-config flags during terraform init
+  }
+}
+```
+
+**File**: `terraform/environments/dev/main.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.85.0"
+    }
+    databricks = {
+      source  = "databricks/databricks"
+      version = "~> 1.35.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+}
+
+provider "databricks" {
+  # Authentication via environment variables:
+  # DATABRICKS_HOST and DATABRICKS_TOKEN
+}
+
+# Get existing resource group
+data "azurerm_resource_group" "existing" {
+  name = var.resource_group_name
+}
+
+# Get existing storage account
+data "azurerm_storage_account" "existing" {
+  name                = var.storage_account_name
+  resource_group_name = var.resource_group_name
+}
+
+# Create Storage Containers
+resource "azurerm_storage_container" "bronze" {
+  name                  = "bronze"
+  storage_account_name  = var.storage_account_name
+  container_access_type = "private"
+}
+
+resource "azurerm_storage_container" "silver" {
+  name                  = "silver"
+  storage_account_name  = var.storage_account_name
+  container_access_type = "private"
+}
+
+resource "azurerm_storage_container" "gold" {
+  name                  = "gold"
+  storage_account_name  = var.storage_account_name
+  container_access_type = "private"
+}
+
+# Storage Credential
+resource "databricks_storage_credential" "main" {
+  name = "${var.environment}_storage_credential"
+  
+  azure_managed_identity {
+    access_connector_id = var.access_connector_id
+  }
+  
+  comment = "Storage credential for ${var.environment} - managed by Terraform"
+}
+
+# External Locations
+resource "databricks_external_location" "bronze" {
+  name            = "${var.environment}_bronze"
+  url             = "abfss://${azurerm_storage_container.bronze.name}@${var.storage_account_name}.dfs.core.windows.net/"
+  credential_name = databricks_storage_credential.main.name
+  comment         = "Bronze layer - raw data"
+}
+
+resource "databricks_external_location" "silver" {
+  name            = "${var.environment}_silver"
+  url             = "abfss://${azurerm_storage_container.silver.name}@${var.storage_account_name}.dfs.core.windows.net/"
+  credential_name = databricks_storage_credential.main.name
+  comment         = "Silver layer - processed data"
+}
+
+resource "databricks_external_location" "gold" {
+  name            = "${var.environment}_gold"
+  url             = "abfss://${azurerm_storage_container.gold.name}@${var.storage_account_name}.dfs.core.windows.net/"
+  credential_name = databricks_storage_credential.main.name
+  comment         = "Gold layer - curated data"
+}
+
+# Unity Catalog - Catalog
+resource "databricks_catalog" "main" {
+  name           = var.catalog_name
+  comment        = "Main catalog for ${var.environment}"
+  isolation_mode = "OPEN"
+  
+  properties = {
+    environment = var.environment
+    managed_by  = "terraform"
+  }
+}
+
+# Schemas
+resource "databricks_schema" "bronze" {
+  catalog_name = databricks_catalog.main.name
+  name         = "bronze"
+  comment      = "Bronze layer schema"
+  
+  properties = {
+    layer = "bronze"
+  }
+}
+
+resource "databricks_schema" "silver" {
+  catalog_name = databricks_catalog.main.name
+  name         = "silver"
+  comment      = "Silver layer schema"
+  
+  properties = {
+    layer = "silver"
+  }
+}
+
+resource "databricks_schema" "gold" {
+  catalog_name = databricks_catalog.main.name
+  name         = "gold"
+  comment      = "Gold layer schema"
+  
+  properties = {
+    layer = "gold"
+  }
+}
+
+# Volumes
+resource "databricks_volume" "bronze_landing" {
+  name             = "landing_zone"
+  catalog_name     = databricks_catalog.main.name
+  schema_name      = databricks_schema.bronze.name
+  volume_type      = "EXTERNAL"
+  storage_location = "${databricks_external_location.bronze.url}landing/"
+  comment          = "Landing zone for raw files"
+}
+
+resource "databricks_volume" "silver_processed" {
+  name             = "processed"
+  catalog_name     = databricks_catalog.main.name
+  schema_name      = databricks_schema.silver.name
+  volume_type      = "EXTERNAL"
+  storage_location = "${databricks_external_location.silver.url}processed/"
+  comment          = "Processed data files"
+}
+
+resource "databricks_volume" "gold_exports" {
+  name             = "exports"
+  catalog_name     = databricks_catalog.main.name
+  schema_name      = databricks_schema.gold.name
+  volume_type      = "EXTERNAL"
+  storage_location = "${databricks_external_location.gold.url}exports/"
+  comment          = "Business data exports"
+}
+
+# Grants
+resource "databricks_grants" "catalog" {
+  catalog = databricks_catalog.main.name
+  
+  grant {
+    principal  = "account users"
+    privileges = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA"]
+  }
+}
+
+resource "databricks_grants" "bronze_schema" {
+  schema = "${databricks_catalog.main.name}.${databricks_schema.bronze.name}"
+  
+  grant {
+    principal  = "account users"
+    privileges = ["USE_SCHEMA", "SELECT", "MODIFY", "CREATE_TABLE"]
+  }
+}
+
+resource "databricks_grants" "silver_schema" {
+  schema = "${databricks_catalog.main.name}.${databricks_schema.silver.name}"
+  
+  grant {
+    principal  = "account users"
+    privileges = ["USE_SCHEMA", "SELECT", "MODIFY", "CREATE_TABLE"]
+  }
+}
+
+resource "databricks_grants" "gold_schema" {
+  schema = "${databricks_catalog.main.name}.${databricks_schema.gold.name}"
+  
+  grant {
+    principal  = "account users"
+    privileges = ["USE_SCHEMA", "SELECT", "CREATE_TABLE"]
+  }
+}
+```
+
+**File**: `terraform/environments/dev/variables.tf`
+
+```hcl
+variable "environment" {
+  description = "Environment name"
+  type        = string
+  default     = "dev"
+}
+
+variable "resource_group_name" {
+  description = "Azure resource group name"
+  type        = string
+}
+
+variable "storage_account_name" {
+  description = "Azure storage account name"
+  type        = string
+}
+
+variable "access_connector_id" {
+  description = "Databricks Access Connector resource ID"
+  type        = string
+}
+
+variable "catalog_name" {
+  description = "Unity Catalog name"
+  type        = string
+}
+
+variable "tags" {
+  description = "Tags for resources"
+  type        = map(string)
+  default = {
+    ManagedBy   = "Terraform"
+    Environment = "dev"
+  }
+}
+```
+
+**File**: `terraform/environments/dev/terraform.tfvars`
+
+```hcl
+# This file is for local development only
+# Values are provided via GitHub Actions secrets in CI/CD
+
+environment = "dev"
+
+# These will be overridden by TF_VAR_* environment variables in GitHub Actions
+# resource_group_name    = "rg-databricks-dev"
+# storage_account_name   = "stdevdatalake001"
+# access_connector_id    = "/subscriptions/.../accessConnectors/dac-dev-uc"
+# catalog_name           = "dev_catalog"
+```
+
+**File**: `terraform/environments/dev/outputs.tf`
+
+```hcl
+output "catalog_name" {
+  description = "Unity Catalog name"
+  value       = databricks_catalog.main.name
+}
+
+output "schemas" {
+  description = "Created schemas"
+  value = {
+    bronze = "${databricks_catalog.main.name}.${databricks_schema.bronze.name}"
+    silver = "${databricks_catalog.main.name}.${databricks_schema.silver.name}"
+    gold   = "${databricks_catalog.main.name}.${databricks_schema.gold.name}"
+  }
+}
+
+output "external_locations" {
+  description = "External locations"
+  value = {
+    bronze = databricks_external_location.bronze.url
+    silver = databricks_external_location.silver.url
+    gold   = databricks_external_location.gold.url
+  }
+}
+
+output "volumes" {
+  description = "Created volumes"
+  value = {
+    bronze_landing   = "${databricks_catalog.main.name}.${databricks_schema.bronze.name}.${databricks_volume.bronze_landing.name}"
+    silver_processed = "${databricks_catalog.main.name}.${databricks_schema.silver.name}.${databricks_volume.silver_processed.name}"
+    gold_exports     = "${databricks_catalog.main.name}.${databricks_schema.gold.name}.${databricks_volume.gold_exports.name}"
+  }
+}
+
+output "storage_credential" {
+  description = "Storage credential name"
+  value       = databricks_storage_credential.main.name
+}
+```
+
+---
+
+## Additional Files
+
+### .gitignore
+
+**File**: `.gitignore`
+
+```
+# Terraform files
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+.terraform.lock.hcl
+
+# Sensitive files
+*.pem
+*.key
+*.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backup files
+*.backup
+*.bak
+```
+
+### README.md
+
+**File**: `README.md`
+
+```markdown
+# Databricks Unity Catalog Infrastructure
+
+This repository contains Terraform configurations for managing Databricks Unity Catalog infrastructure.
+
+## Prerequisites
+
+- GitHub account with repository access
+- Databricks workspace with Metastore Admin permission
+- Azure Storage Blob Data Contributor access
+- Access to Azure Service Principal credentials
+
+## Deployment
+
+### Dev Environment
+
+Deployments to dev happen automatically when changes are merged to `main` branch.
+
+### Production Environment
+
+1. Go to **Actions** tab
+2. Select **Terraform Apply - Prod** workflow
+3. Click **Run workflow**
+4. Type "apply" to confirm
+5. Wait for approval (if configured)
+
+## Local Development
+
+While Terraform is not installed locally, you can still:
+- Edit configuration files
+- Create pull requests
+- Review plans in PR comments
+
+## Repository Structure
+
+```
+├── .github/workflows/    # GitHub Actions workflows
+├── terraform/
+│   └── environments/
+│       ├── dev/          # Dev environment config
+│       └── prod/         # Prod environment config
+```
+
+## Support
+
+For issues or questions, contact the platform team.
+```
+
+---
+
+## Deployment Process
+
+### Initial Setup (One-time)
+
+1. **Create GitHub Repository**
+   ```bash
+   # Create repo and push initial commit
+   git init
+   git add .
+   git commit -m "Initial commit: Databricks Terraform setup"
+   git branch -M main
+   git remote add origin https://github.com/YOUR_ORG/databricks-terraform-uc.git
+   git push -u origin main
+   ```
+
+2. **Configure GitHub Secrets**
+   - Add all secrets as described in "GitHub Secrets Configuration" section
+   - Test credentials by triggering a workflow run
+
+3. **Create Environments** (Optional but recommended)
+   - Go to Settings → Environments
+   - Create `dev` and `prod` environments
+   - Add protection rules for `prod`
+
+### Day-to-Day Development Workflow
+
+#### Making Changes
+
+```bash
+# 1. Create a new branch
+git checkout -b feature/add-new-schema
+
+# 2. Make your changes to Terraform files
+# Edit terraform/environments/dev/main.tf
+
+# 3. Commit changes
+git add .
+git commit -m "Add new schema for marketing data"
+
+# 4. Push to GitHub
+git push origin feature/add-new-schema
+```
+
+#### Creating Pull Request
+
+1. Go to GitHub repository
+2. Click "Pull requests" → "New pull request"
+3. Select your branch
+4. Create pull request
+5. **Automated actions**:
+   - Terraform Plan workflow runs automatically
+   - Plan output is commented on PR
+   - Review the plan
+
+#### Merging to Deploy
+
+1. Review Terraform plan in PR comments
+2. Get approval from team (if required)
+3. Merge PR to `main` branch
+4. **Automated deployment**:
+   - Terraform Apply workflow runs automatically
+   - Resources are created/updated in Dev
+   - Check workflow logs for confirmation
+
+### Deploying to Production
+
+1. Go to **Actions** tab in GitHub
+2. Select **Terraform Apply - Prod** workflow
+3. Click **Run workflow** button
+4. Type "apply" in confirmation field
+5. Click green **Run workflow** button
+6. Wait for approval (if environment protection is configured)
+7. Monitor workflow execution
+8. Verify deployment in Databricks UI
+
+---
+
+## Pull Request Workflow Example
+
+### Step 1: Create Feature Branch
+
+```bash
+git checkout -b feature/add-finance-schema
+```
+
+### Step 2: Add New Schema
+
+Edit `terraform/environments/dev/main.tf`:
+
+```hcl
+# Add after existing schemas
+resource "databricks_schema" "finance" {
+  catalog_name = databricks_catalog.main.name
+  name         = "finance"
+  comment      = "Finance domain data"
+  
+  properties = {
+    domain = "finance"
+  }
+}
+
+resource "databricks_grants" "finance_schema" {
+  schema = "${databricks_catalog.main.name}.${databricks_schema.finance.name}"
+  
+  grant {
+    principal  = "account users"
+    privileges = ["USE_SCHEMA", "SELECT"]
+  }
+}
+```
+
+### Step 3: Commit and Push
+
+```bash
+git add terraform/environments/dev/main.tf
+git commit -m "Add finance schema to Unity Catalog"
+git push origin feature/add-finance-schema
+```
+
+### Step 4: Create Pull Request
+
+1. Go to GitHub
+2. Create PR from `feature/add-finance-schema` to `main`
+3. Wait for Terraform Plan to run
+4. Review plan in PR comments:
+
+```
+Terraform will perform the following actions:
+
+  # databricks_schema.finance will be created
+  + resource "databricks_schema" "finance" {
+      + catalog_name = "dev_catalog"
+      + name         = "finance"
+      + comment      = "Finance domain data"
+    }
+
+  # databricks_grants.finance_schema will be created
+  + resource "databricks_grants" "finance_schema" {
+      + schema = "dev_catalog.finance"
+      + grant {
+          + principal  = "account users"
+          + privileges = ["USE_SCHEMA", "SELECT"]
+        }
+    }
+
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+### Step 5: Merge and Deploy
+
+1. Approve PR
+2. Merge to `main`
+3. Terraform Apply workflow runs automatically
+4. Check workflow logs for success
+5. Verify in Databricks UI
+
+---
+
+## Troubleshooting
+
+### Issue 1: Workflow Fails with Authentication Error
+
+**Error**: "Error: Error building account level client: authentication is not configured for provider"
+
+**Solution**:
+1. Check GitHub secrets are correctly set
+2. Verify secret names match workflow environment variables
+3. Ensure DATABRICKS_TOKEN is not expired:
+   ```bash
+   # In Databricks UI: Settings → Developer → Access Tokens
+   # Check token expiration and regenerate if needed
+   ```
+
+### Issue 2: Backend Initialization Fails
+
+**Error**: "Error: Failed to get existing workspaces: storage account not found"
+
+**Solution**:
+1. Verify TF_STATE_* secrets are correct
+2. Check if storage account exists:
+   ```bash
+   az storage account show --name sttfstatedatabricks --resource-group rg-terraform-state
+   ```
+3. Ensure service principal has access to storage account
+
+### Issue 3: Plan Shows Unexpected Changes
+
+**Error**: Resources show as "to be destroyed and recreated"
+
+**Solution**:
+1. Review the plan carefully
+2. Check if resource names changed
+3. Use `terraform state mv` if needed (via workflow_dispatch)
+4. Consider using lifecycle blocks to prevent destruction
+
+### Issue 4: Storage Container Already Exists
+
+**Error**: "Error: A resource with the ID ... already exists"
+
+**Solution**:
+```bash
+# Import existing resource into state
+# Add this step to a special "import" workflow
+terraform import azurerm_storage_container.bronze /subscriptions/.../containers/bronze
+```
+
+### Issue 5: Insufficient Permissions
+
+**Error**: "Error: cannot create storage credential, permission denied"
+
+**Solution**:
+1. Verify you have Metastore Admin role in Databricks
+2. Check Access Connector has permissions on storage
+3. Contact admin to verify role assignments
+
+---
+
+## Best Practices
+
+### 1. Always Use Pull Requests
+
+- Never push directly to `main`
+- Always create feature branches
+- Review Terraform plans before merging
+
+### 2. Use Descriptive Commit Messages
+
+```bash
+# Good
+git commit -m "Add sales schema with external location"
+
+# Bad
+git commit -m "Update files"
+```
+
+### 3. Keep Environments in Sync
+
+- Use same structure for dev and prod
+- Only differ in variable values
+- Test in dev before deploying to prod
+
+### 4. Secure Secrets Management
+
+- Never commit secrets to repository
+- Rotate tokens regularly (every 90 days)
+- Use environment-specific secrets
+
+### 5. Monitor Workflow Runs
+
+- Check GitHub Actions tab regularly
+- Review workflow logs for errors
+- Set up notifications for failures
+
+### 6. Document Changes
+
+- Update CHANGELOG.md for significant changes
+- Add comments to complex Terraform blocks
+- Keep README.md updated
+
+### 7. State File Management
+
+- Never modify state file manually
+- Use terraform state commands via workflows
+- Keep backups of state file
+- Enable state locking
+
+---
+
+## Advanced: Custom Workflows
+
+### Workflow: Import Existing Resources
+
+**File**: `.github/workflows/terraform-import.yml`
+
+```yaml
+name: 'Import Existing Resources'
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_type:
+        description: 'Resource type (e.g., azurerm_storage_container)'
+        required: true
+      resource_name:
+        description: 'Resource name in Terraform'
+        required: true
+      resource_id:
+        description: 'Azure/Databricks resource ID'
+        required: true
+      environment:
+        description: 'Environment'
+        type: choice
+        options:
+          - dev
+          - prod
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.7.0'
+      
+      - name: Terraform Init
+        working-directory: ./terraform/environments/${{ github.event.inputs.environment }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        run: terraform init
+      
+      - name: Terraform Import
+        working-directory: ./terraform/environments/${{ github.event.inputs.environment }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          DATABRICKS_HOST: ${{ github.event.inputs.environment == 'dev' && secrets.DATABRICKS_HOST_DEV || secrets.DATABRICKS_HOST_PROD }}
+          DATABRICKS_TOKEN: ${{ github.event.inputs.environment == 'dev' && secrets.DATABRICKS_TOKEN_DEV || secrets.DATABRICKS_TOKEN_PROD }}
+        run: |
+          terraform import ${{ github.event.inputs.resource_type }}.${{ github.event.inputs.resource_name }} "${{ github.event.inputs.resource_id }}"
+```
+
+---
+
+## Monitoring and Alerts
+
+### Enable Email Notifications
+
+1. Go to GitHub profile → Settings → Notifications
+2. Enable "Actions" notifications
+3. Choose email preferences
+
+### Slack Integration (Optional)
+
+Add to workflow:
+
+```yaml
+- name: Notify Slack
+  if: always()
+  uses: 8398a7/action-slack@v3
+  with:
+    status: ${{ job.status }}
+    text: 'Terraform deployment completed'
+    webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+```
+
+---
+
+## Summary
+
+This setup enables you to:
+
+✅ Manage Databricks infrastructure without local Terraform installation
+✅ Use Git for version control and collaboration
+✅ Automate deployments via GitHub Actions
+✅ Review changes via Pull Requests before applying
+✅ Maintain separate dev and prod environments
+✅ Track all infrastructure changes in Git history
+✅ Implement approval workflows for production
+✅ Roll back changes if needed
+
+**Next Steps**:
+1. Set up GitHub repository with provided structure
+2. Configure all GitHub secrets
+3. Create initial commit and push
+4. Test with a simple change in dev
+5. Verify deployment in Databricks UI
+6. Proceed with production deployment
+
+---
+
+**Created for**: Ganesh - Databricks Platform Admin
+**Deployment Method**: GitHub Actions (No local Terraform required)
+**Last Updated**: February 2026
